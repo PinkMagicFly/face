@@ -1,0 +1,12 @@
+C1
+C2
+D1
+GND
+J1
+LED1
+R1
+R2
+SW1
+TP1
+U1
+VCC
