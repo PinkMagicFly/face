@@ -23,15 +23,39 @@ import zlib
 from pathlib import Path
 from typing import Iterable
 
-COMPONENT_RE = re.compile(
-    r"\b(?:"
-    r"R|RN|RP|C|L|D|LED|Q|U|IC|J|JP|P|TP|SW|S|Y|X|F|FB|K|T|VR|RV|"
-    r"CN|CONN|H|M|BT|B|BZ|LS|ANT|XTAL|OSC|ZD|Z|TVS|MOV|NTC|PTC|"
-    r"RLY|XFMR|BR|REG|MOD|SENSOR|HEADER|GND|VCC|VIN|VOUT|AVDD|DVDD"
-    r")[-_ ]?\d+[A-Z0-9]*(?:[-_.][A-Z0-9]+)?\b",
-    re.IGNORECASE,
+STRICT_PREFIXES = (
+    "CONN",
+    "LED",
+    "RLY",
+    "TVS",
+    "RN",
+    "RP",
+    "FB",
+    "JP",
+    "TP",
+    "SW",
+    "IC",
+    "BT",
+    "BZ",
+    "LS",
+    "VR",
+    "RV",
+    "ZD",
+    "CN",
+    "BR",
+    "R",
+    "C",
+    "L",
+    "D",
+    "Q",
+    "U",
+    "J",
+    "F",
 )
-TEXTY_RE = re.compile(r"[A-Za-z][A-Za-z0-9_+./#-]{1,}")
+POWER_LABELS = {"GND", "VCC", "AVDD", "DVDD"}
+STRICT_COMPONENT_RE = re.compile(rf"^(?:{'|'.join(STRICT_PREFIXES)})(?:[1-9]\d?)(?:[A-Z])?$", re.IGNORECASE)
+POWER_RE = re.compile(r"^(?:GND|VCC|AVDD|DVDD|VIN\d{0,2}|VOUT\d{0,2})$", re.IGNORECASE)
+TEXTY_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.+/#-]{0,31}")
 
 MEGA_API = "https://g.api.mega.co.nz/cs?id=0"
 
@@ -264,19 +288,42 @@ def external_ocr(pdf_path: Path, dpi: int) -> str:
 
 def normalize_name(name: str) -> str:
     name = name.strip().upper().replace(" ", "")
-    name = re.sub(r"[^A-Z0-9_.+-]", "", name)
-    return name
+    name = re.sub(r"[^A-Z0-9_.+/#-]", "", name)
+    return name.strip("._+-/#")
+
+
+def strict_component_name(token: str) -> str | None:
+    """Return a clean reference designator, or None for noisy PDF/OCR text.
+
+    The damaged challenge PDF produces thousands of random strings that merely
+    look like ``letter + digit``.  Keep only whole-token, conventional reference
+    designators such as R12, C3, U1, JP2, TP4, and exact power-net labels.
+    """
+    name = normalize_name(token)
+    if not name:
+        return None
+    if POWER_RE.fullmatch(name):
+        return name
+    if not name.isalnum():
+        return None
+    if STRICT_COMPONENT_RE.fullmatch(name):
+        return name
+    return None
+
+
+def component_sort_key(name: str) -> tuple[str, int, str]:
+    number = re.search(r"\d+", name)
+    prefix = name[: number.start()] if number else name
+    return prefix, int(number.group(0)) if number else -1, name
 
 
 def extract_names(text: str) -> list[str]:
-    names = {normalize_name(m.group(0)) for m in COMPONENT_RE.finditer(text)}
-    # Keep short all-caps labels that often appear as connector/power names.
+    names = set()
     for token in TEXTY_RE.findall(text):
-        t = normalize_name(token)
-        if 2 <= len(t) <= 24 and (re.search(r"\d", t) or t in {"GND", "VCC", "VIN", "VOUT", "AVDD", "DVDD"}):
-            if COMPONENT_RE.search(t) or t in {"GND", "VCC", "VIN", "VOUT", "AVDD", "DVDD"}:
-                names.add(t)
-    return sorted(names, key=lambda s: (re.sub(r"\d.*", "", s), int(re.search(r"\d+", s).group(0)) if re.search(r"\d+", s) else -1, s))
+        name = strict_component_name(token)
+        if name:
+            names.add(name)
+    return sorted(names, key=component_sort_key)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -300,34 +347,41 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    repaired = carve_pdf(raw)
-
+    repaired_path: Path | None = None
     temp_repaired: tempfile.NamedTemporaryFile[bytes] | None = None
-    if args.keep_repaired is not None:
-        repaired_path = Path(args.keep_repaired) if args.keep_repaired else args.output.with_suffix(".repaired.pdf")
-        repaired_path.write_bytes(repaired)
+    if b"%PDF-" not in raw:
+        # Also support filtering a previously generated noisy text candidate list.
+        # This is useful for the challenge output that contained thousands of
+        # random letter+digit strings from binary/PDF noise.
+        merged_text = raw.decode("utf-8", "ignore") or raw.decode("latin-1", "ignore")
     else:
-        temp_repaired = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
-        temp_repaired.write(repaired)
-        temp_repaired.close()
-        repaired_path = Path(temp_repaired.name)
+        repaired = carve_pdf(raw)
+        if args.keep_repaired is not None:
+            repaired_path = Path(args.keep_repaired) if args.keep_repaired else args.output.with_suffix(".repaired.pdf")
+            repaired_path.write_bytes(repaired)
+        else:
+            temp_repaired = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+            temp_repaired.write(repaired)
+            temp_repaired.close()
+            repaired_path = Path(temp_repaired.name)
 
-    chunks = list(iter_pdf_text_chunks(repaired))
-    text_sources = ["\n".join(chunks), external_text(repaired_path)]
-    if args.ocr:
-        text_sources.append(external_ocr(repaired_path, args.dpi))
-    merged_text = "\n".join(t for t in text_sources if t)
+        chunks = list(iter_pdf_text_chunks(repaired))
+        text_sources = ["\n".join(chunks), external_text(repaired_path)]
+        if args.ocr:
+            text_sources.append(external_ocr(repaired_path, args.dpi))
+        merged_text = "\n".join(t for t in text_sources if t)
+
     names = extract_names(merged_text)
 
     args.output.write_text("\n".join(names) + ("\n" if names else ""), encoding="utf-8")
     if args.json_output:
         args.json_output.write_text(json.dumps({"count": len(names), "components": names}, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    if temp_repaired is not None:
+    if temp_repaired is not None and repaired_path is not None:
         repaired_path.unlink(missing_ok=True)
 
     print(f"input: {input_label}")
-    if args.keep_repaired is not None:
+    if args.keep_repaired is not None and repaired_path is not None:
         print(f"repaired_pdf: {repaired_path}")
     print(f"components: {len(names)}")
     for name in names:
