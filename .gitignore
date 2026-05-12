@@ -1,0 +1,4 @@
+*.pdf
+*.repaired.pdf
+__pycache__/
+*.pyc
