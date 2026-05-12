@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import math
 import re
 import shutil
 import struct
@@ -20,6 +21,7 @@ import tempfile
 import urllib.parse
 import urllib.request
 import zlib
+from collections import Counter
 from pathlib import Path
 from typing import Iterable
 
@@ -53,7 +55,10 @@ STRICT_PREFIXES = (
     "F",
 )
 POWER_LABELS = {"GND", "VCC", "AVDD", "DVDD"}
-STRICT_COMPONENT_RE = re.compile(rf"^(?:{'|'.join(STRICT_PREFIXES)})(?:[1-9]\d?)(?:[A-Z])?$", re.IGNORECASE)
+STRICT_COMPONENT_RE = re.compile(
+    rf"^(?P<base>(?:{'|'.join(STRICT_PREFIXES)})(?:[1-9]\d?))(?:[A-Z])?$",
+    re.IGNORECASE,
+)
 POWER_RE = re.compile(r"^(?:GND|VCC|AVDD|DVDD|VIN\d{0,2}|VOUT\d{0,2})$", re.IGNORECASE)
 TEXTY_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.+/#-]{0,31}")
 
@@ -238,9 +243,9 @@ def decode_stream(stream: bytes, header: bytes) -> bytes:
     return stream
 
 
-def iter_pdf_text_chunks(pdf_bytes: bytes) -> Iterable[str]:
+def iter_pdf_text_chunks(pdf_bytes: bytes, include_container: bool = False) -> Iterable[str]:
     """Yield text chunks found in PDF literal/hex strings and content streams."""
-    candidates = [pdf_bytes]
+    candidates: list[bytes] = [pdf_bytes] if include_container else []
     for match in re.finditer(rb"(<<.*?>>)\s*stream\r?\n?(.*?)\r?\n?endstream", pdf_bytes, re.S):
         candidates.append(decode_stream(match.group(2), match.group(1)))
 
@@ -286,10 +291,65 @@ def external_ocr(pdf_path: Path, dpi: int) -> str:
         return "\n".join(texts)
 
 
+def tiled_ocr(pdf_path: Path, dpi: int) -> str:
+    """OCR the PDF by splitting rendered pages into tiles.
+
+    Large circuit sheets tend to contain many tiny labels. Running OCR on the
+    whole page at once often misses those labels, so split pages into smaller
+    tiles first and OCR each tile independently.
+    """
+    if not (shutil.which("pdftoppm") and shutil.which("tesseract")):
+        return ""
+    with tempfile.TemporaryDirectory() as tmp:
+        prefix = Path(tmp) / "page"
+        subprocess.run(["pdftoppm", "-r", str(dpi), "-png", str(pdf_path), str(prefix)], check=False)
+        texts: list[str] = []
+        for image in sorted(Path(tmp).glob("page-*.png")):
+            try:
+                from PIL import Image
+            except ImportError:
+                break
+            with Image.open(image) as source:
+                width, height = source.size
+                cols = 2 if width > 2000 else 1
+                rows = 2 if height > 1500 else 1
+                tile_w = math.ceil(width / cols)
+                tile_h = math.ceil(height / rows)
+                for row in range(rows):
+                    for col in range(cols):
+                        left = col * tile_w
+                        upper = row * tile_h
+                        right = min(width, left + tile_w)
+                        lower = min(height, upper + tile_h)
+                        tile_path = Path(tmp) / f"{image.stem}-{row}-{col}.png"
+                        source.crop((left, upper, right, lower)).save(tile_path)
+                        texts.append(run_tool(["tesseract", str(tile_path), "stdout", "--psm", "11"]))
+        return "\n".join(t for t in texts if t)
+
+
 def normalize_name(name: str) -> str:
     name = name.strip().upper().replace(" ", "")
     name = re.sub(r"[^A-Z0-9_.+/#-]", "", name)
     return name.strip("._+-/#")
+
+
+def normalize_ocr_text(text: str) -> str:
+    """Apply lightweight OCR cleanup before token extraction."""
+    normalized = text.upper()
+    substitutions = {
+        "FI": "F1",
+        "RI": "R1",
+        "LI": "L1",
+        "JI": "J1",
+        "QI": "Q1",
+        "DI": "D1",
+        "OI": "01",
+        "OA": "0A",
+        "COA": "C0A",
+    }
+    for old, new in substitutions.items():
+        normalized = normalized.replace(old, new)
+    return normalized
 
 
 def strict_component_name(token: str) -> str | None:
@@ -306,8 +366,10 @@ def strict_component_name(token: str) -> str | None:
         return name
     if not name.isalnum():
         return None
-    if STRICT_COMPONENT_RE.fullmatch(name):
-        return name
+    match = STRICT_COMPONENT_RE.fullmatch(name)
+    if match:
+        # Canonicalize split-unit labels like U1A/U1B back to the base refdes.
+        return match.group("base").upper()
     return None
 
 
@@ -323,6 +385,22 @@ def extract_names(text: str) -> list[str]:
         name = strict_component_name(token)
         if name:
             names.add(name)
+    return sorted(names, key=component_sort_key)
+
+
+def extract_name_counts(text: str) -> Counter[str]:
+    counts: Counter[str] = Counter()
+    for token in TEXTY_RE.findall(text):
+        name = strict_component_name(token)
+        if name:
+            counts[name] += 1
+    return counts
+
+
+def merge_names(*groups: Iterable[str]) -> list[str]:
+    names: set[str] = set()
+    for group in groups:
+        names.update(group)
     return sorted(names, key=component_sort_key)
 
 
@@ -369,9 +447,19 @@ def main(argv: list[str] | None = None) -> int:
         text_sources = ["\n".join(chunks), external_text(repaired_path)]
         if args.ocr:
             text_sources.append(external_ocr(repaired_path, args.dpi))
+            text_sources.append(normalize_ocr_text(tiled_ocr(repaired_path, args.dpi)))
         merged_text = "\n".join(t for t in text_sources if t)
 
     names = extract_names(merged_text)
+    if b"%PDF-" in raw and len(names) < 25:
+        # Some damaged PDFs keep useful label fragments only in the repaired
+        # container bytes. Treat that as a fallback path so normal PDFs do not
+        # inherit the extra noise by default.
+        fallback_text = "\n".join(iter_pdf_text_chunks(repaired, include_container=True))
+        fallback_counts = extract_name_counts(fallback_text)
+        high_confidence = [name for name, count in fallback_counts.items() if count >= 5]
+        fallback_names = high_confidence or list(fallback_counts)
+        names = merge_names(names, fallback_names)
 
     args.output.write_text("\n".join(names) + ("\n" if names else ""), encoding="utf-8")
     if args.json_output:
